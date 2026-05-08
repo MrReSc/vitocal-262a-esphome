@@ -36,6 +36,26 @@ via the ESPHome API.
 
 ---
 
+## Wiring
+
+```
+ESP32-S3              SN65HVD230            Vitocal 262-A
+─────────────         ──────────────        ──────────────
+GPIO17 (TX) ───────── TXD
+GPIO18 (RX) ───────── RXD
+3V3         ───────── VCC
+GND         ───────── GND
+                      CANH ──────────────── CAN High
+                      CANL ──────────────── CAN Low
+```
+
+The Vitocal 262-A has two CAN bus connectors inside the unit, both labeled **X91**.
+Either connector can be used. The pins are labeled **H** (CAN High) and **L** (CAN Low).
+
+**Note:** UART logging is disabled in the ESPHome config (`baud_rate: 0`) because the default UART pins (GPIO17/GPIO18) are used for the CAN transceiver.
+
+---
+
 ## Sensors & Controls
 
 All entities exposed to Home Assistant:
