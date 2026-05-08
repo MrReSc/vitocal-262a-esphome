@@ -1,0 +1,534 @@
+substitutions:
+  poll_interval: "750ms"
+
+esphome:
+  name: "vitocal-262-a"
+  friendly_name: "Vitocal 262-A"
+  name_add_mac_suffix: false
+  on_boot:
+    priority: -100.0  # run after all components are initialized
+    then:
+      - delay: 3s  # wait for the CAN bus to be ready
+      - lambda: |-
+          // UDS ReadDataByIdentifier: DID 0x0244 = 580 (SoftwareVersion) — one-shot, value never changes
+          id(cb)->send_data(0x680, 0, std::vector<uint8_t>{0x03, 0x22, 0x02, 0x44, 0x00, 0x00, 0x00, 0x00});
+      - delay: 200ms  # give the heat pump time to respond before sending the next request
+      - lambda: |-
+          // UDS ReadDataByIdentifier: DID 0x0245 = 581 (HardwareVersion) — one-shot, value never changes
+          id(cb)->send_data(0x680, 0, std::vector<uint8_t>{0x03, 0x22, 0x02, 0x45, 0x00, 0x00, 0x00, 0x00});
+
+esp32:
+  variant: esp32s3
+  board: esp32-s3-devkitc-1
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+  baud_rate: 0  # disable UART log output — the pins are used by the CAN transceiver
+
+api:
+  encryption:
+    key: "REPLACE_WITH_YOUR_BASE64_API_KEY"
+  reboot_timeout: 0s  # don't reboot when Home Assistant is unavailable
+
+ota:
+  - platform: esphome
+  - platform: web_server
+
+wifi:
+  ssid: "YOUR_WIFI_SSID"
+  password: "YOUR_WIFI_PASSWORD"
+  use_address: "192.168.1.100"
+  min_auth_mode: WPA2
+
+time:
+  - platform: sntp
+    id: time_sntp
+    timezone: Europe/Zurich
+    servers:
+      - 192.168.1.1
+
+web_server:
+  port: 80
+  local: true
+  include_internal: true
+
+# Polling state machine: the interval timer sends one UDS read request per tick,
+# waits for the response, then moves to the next DID in the list.
+globals:
+  - id: poll_dids  # list of data point IDs (DIDs) to read from the heat pump
+    type: std::vector<uint16_t>
+    restore_value: no
+    initial_value: '{271, 396, 505, 506, 565, 1391, 2320, 2351, 2352, 2369, 2370, 2488, 2496, 3232, 3233, 3234}'
+  - id: poll_index
+    type: size_t
+    restore_value: no
+    initial_value: '0'
+  - id: pending_did  # DID we are currently waiting a response for
+    type: uint16_t
+    restore_value: no
+    initial_value: '0'
+  - id: request_started_ms  # timestamp of the last request, used to detect timeouts
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: read_pending  # true while we are waiting for a CAN response
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: write_lock  # true while a write script is running, blocks polling
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: verify_did  # DID the write script is waiting to read back
+    type: uint16_t
+    restore_value: no
+    initial_value: '0'
+  - id: verify_active  # true while a write script is waiting for its readback
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: verify_valid  # set to true by the CAN handler when the verify read arrives
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+# Write DID 0396 (hot water setpoint), then read it back to confirm the value was accepted.
+# The value is encoded as a signed 16-bit integer scaled by 10 (e.g. 50.0°C -> 500).
+script:
+  - id: write_setpoint_0396
+    mode: restart
+    parameters:
+      value: float
+    then:
+      - lambda: |-
+          id(write_lock) = true;
+          id(read_pending) = false;
+          id(verify_active) = false;
+          id(verify_valid) = false;
+
+          int32_t scaled = (int32_t) lroundf(value * 10.0f);
+          uint16_t encoded = (uint16_t) ((int16_t) scaled);
+          // UDS WriteDataByIdentifier (service 0x2E), DID 0x018C = 396
+          id(cb)->send_data(0x680, 0, std::vector<uint8_t>{
+            0x05, 0x2E, 0x01, 0x8C,
+            (uint8_t) (encoded & 0xFF),
+            (uint8_t) ((encoded >> 8) & 0xFF),
+            0x00, 0x00
+          });
+      - delay: 500ms  # give the heat pump time to process the write before reading back
+      - lambda: |-
+          id(verify_did) = 396;
+          id(verify_active) = true;
+          id(verify_valid) = false;
+          id(pending_did) = 396;
+          id(request_started_ms) = millis();
+          id(read_pending) = true;
+          // UDS ReadDataByIdentifier (service 0x22), DID 0x018C = 396
+          id(cb)->send_data(0x680, 0, std::vector<uint8_t>{
+            0x03, 0x22, 0x01, 0x8C,
+            0x00, 0x00, 0x00, 0x00
+          });
+      - wait_until:
+          condition:
+            lambda: 'return !id(read_pending) && id(verify_valid);'
+          timeout: 1500ms
+      - lambda: |-
+          if (id(read_pending) || !id(verify_valid)) {
+            ESP_LOGW("vitocal_262_a", "Verify read failed for DID 396");
+          }
+          id(read_pending) = false;
+          id(verify_active) = false;
+          id(verify_valid) = false;
+          id(write_lock) = false;
+
+canbus:
+  - platform: esp32_can
+    id: cb
+    # SN65HVD230 wiring:
+    # GPIO17 -> TXD
+    # GPIO18 <- RXD
+    # 3V3 -> VCC
+    # GND -> GND
+    # CANH -> CAN High of Vitocal
+    # CANL -> CAN Low of Vitocal
+    tx_pin: GPIO17
+    rx_pin: GPIO18
+    can_id: 0x680  # our sender address (Viessmann tester node)
+    bit_rate: 250kbps
+    on_frame:
+      - can_id: 0x690  # heat pump response address
+        then:
+          - lambda: |-
+              auto read_u = [](const std::vector<uint8_t> &p, size_t off, size_t len) -> uint64_t {
+                uint64_t v = 0;
+                for (size_t i = 0; i < len && i < 8; i++) {
+                  if (off + i < p.size()) v |= (uint64_t) p[off + i] << (8 * i);
+                }
+                return v;
+              };
+              auto read_i = [&](const std::vector<uint8_t> &p, size_t off, size_t len) -> int64_t {
+                uint64_t u = read_u(p, off, len);
+                if (len == 0) return 0;
+                if (len >= 8) return (int64_t) u;
+                uint64_t sign = 1ULL << (len * 8 - 1);
+                if (u & sign) u |= (~0ULL) << (len * 8);
+                return (int64_t) u;
+              };
+              auto scaled_value = [&](const std::vector<uint8_t> &p, size_t off, size_t len, float scale, bool is_signed) -> float {
+                double v = is_signed ? (double) read_i(p, off, len) : (double) read_u(p, off, len);
+                return (float) (v / scale);
+              };
+              auto publish_temperature = [&](const std::vector<uint8_t> &p, auto &sensor_id) {
+                // byte 8 is the sensor status flag — 0 means the reading is valid
+                if (p.size() >= 9 && read_u(p, 8, 1) == 0) {
+                  sensor_id->publish_state(scaled_value(p, 0, 2, 10.0f, true));
+                }
+              };
+              auto dhw_status_text = [](uint8_t v) -> const char * {
+                switch (v) {
+                  case 0: return "Idle";
+                  case 1: return "Active";
+                  case 2: return "Postrun";
+                  default: return "Unknown";
+                }
+              };
+              auto publish_payload = [&](uint16_t did, const std::vector<uint8_t> &p) {
+                switch (did) {
+                  case 271:
+                    publish_temperature(p, id(va271_actual));
+                    break;
+                  case 396:
+                    if (p.size() >= 2) {
+                      id(va396_setpoint).publish_state(scaled_value(p, 0, 2, 10.0f, true));
+                    }
+                    break;
+                  case 565:
+                    if (p.size() >= 4) {
+                      id(va565_today).publish_state(scaled_value(p, 0, 4, 10.0f, false));
+                    }
+                    break;
+                  case 1391:
+                    if (p.size() >= 4) {
+                      id(va1391_today).publish_state(scaled_value(p, 0, 4, 10.0f, false));
+                    }
+                    break;
+                  case 2320:
+                    if (p.size() >= 1) {
+                      id(va2320_dhw_status).publish_state(dhw_status_text((uint8_t) read_u(p, 0, 1)));
+                    }
+                    break;
+                  case 2351:
+                    if (p.size() >= 1) {
+                      id(va2351_compressor_active).publish_state(read_u(p, 0, 1) == 1);
+                    }
+                    break;
+                  case 2352:
+                    if (p.size() >= 1) {
+                      id(va2352_heater_active).publish_state(read_u(p, 0, 1) == 1);
+                    }
+                    break;
+                  case 2369:
+                    if (p.size() >= 12) {
+                      id(va2369_compressor_starts).publish_state(read_u(p, 6, 2));   // starts at byte offset 6
+                      id(va2369_compressor_hours).publish_state(read_u(p, 10, 2));   // hours at byte offset 10
+                    }
+                    break;
+                  case 2370:
+                    if (p.size() >= 9) {
+                      id(va2370_heater_starts).publish_state(read_u(p, 3, 2));   // starts at byte offset 3
+                      id(va2370_heater_hours).publish_state(read_u(p, 7, 2));    // hours at byte offset 7
+                    }
+                    break;
+                  case 2488:
+                    if (p.size() >= 4) {
+                      id(va2488_power_system).publish_state(scaled_value(p, 0, 4, 1.0f, true));
+                    }
+                    break;
+                  case 2496:
+                    if (p.size() >= 4) {
+                      id(va2496_thermal_system).publish_state(scaled_value(p, 0, 4, 1.0f, true));
+                    }
+                    break;
+                  case 3232:
+                    publish_temperature(p, id(va3232_actual));
+                    break;
+                  case 3233:
+                    publish_temperature(p, id(va3233_actual));
+                    break;
+                  case 3234:
+                    publish_temperature(p, id(va3234_actual));
+                    break;
+                  case 505:
+                    if (p.size() >= 3) {
+                      char buf[12];
+                      snprintf(buf, sizeof(buf), "%02d.%02d.%04d", p[0], p[1], 2000 + p[2]);
+                      id(va505_date).publish_state(buf);
+                    }
+                    break;
+                  case 506:
+                    if (p.size() >= 3) {
+                      char buf[9];
+                      snprintf(buf, sizeof(buf), "%02d:%02d:%02d", p[0], p[1], p[2]);
+                      id(va506_time).publish_state(buf);
+                    }
+                    break;
+                  case 580:
+                    if (p.size() >= 8) {
+                      char buf[32];
+                      uint16_t a = p[0] | (p[1] << 8), b = p[2] | (p[3] << 8);
+                      uint16_t c = p[4] | (p[5] << 8), d = p[6] | (p[7] << 8);
+                      snprintf(buf, sizeof(buf), "%u.%u.%u.%u", a, b, c, d);
+                      id(va580_sw_version).publish_state(buf);
+                    }
+                    break;
+                  case 581:
+                    if (p.size() >= 8) {
+                      char buf[32];
+                      uint16_t a = p[0] | (p[1] << 8), b = p[2] | (p[3] << 8);
+                      uint16_t c = p[4] | (p[5] << 8), d = p[6] | (p[7] << 8);
+                      snprintf(buf, sizeof(buf), "%u.%u.%u.%u", a, b, c, d);
+                      id(va581_hw_version).publish_state(buf);
+                    }
+                    break;
+                  default:
+                    break;
+                }
+                // signal the write script that its readback arrived
+                if (id(verify_active) && did == id(verify_did)) id(verify_valid) = true;
+                // unblock the poller so it can move to the next DID
+                if (id(read_pending) && did == id(pending_did)) id(read_pending) = false;
+              };
+
+              static bool multi_active = false;
+              static uint16_t multi_did = 0;
+              static uint16_t multi_expected = 0;
+              static std::vector<uint8_t> multi_payload;
+
+              if (x.empty()) return;
+              uint8_t frame_type = x[0] & 0xF0;
+              // ISO 15765-2 (CAN transport layer) frame reassembly
+              if (frame_type == 0x00) {  // single frame — payload fits in one CAN message
+                uint8_t len = x[0] & 0x0F;
+                if (x.size() >= 4 && len >= 3 && x[1] == 0x62) {
+                  uint16_t did = ((uint16_t) x[2] << 8) | x[3];
+                  std::vector<uint8_t> payload;
+                  for (size_t i = 4; i < x.size() && payload.size() < len - 3; i++) payload.push_back(x[i]);
+                  publish_payload(did, payload);
+                }
+                return;
+              }
+              if (frame_type == 0x10) {  // first frame of a multi-frame response
+                if (x.size() < 5 || x[2] != 0x62) return;
+                uint16_t total_len = (((uint16_t) x[0] & 0x0F) << 8) | x[1];
+                multi_did = ((uint16_t) x[3] << 8) | x[4];
+                multi_expected = total_len >= 3 ? total_len - 3 : 0;
+                multi_payload.clear();
+                multi_payload.reserve(multi_expected);
+                for (size_t i = 5; i < x.size() && multi_payload.size() < multi_expected; i++) multi_payload.push_back(x[i]);
+                multi_active = true;
+                id(cb)->send_data(0x680, 0, std::vector<uint8_t>{0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00});  // flow control: continue sending
+                if (multi_payload.size() >= multi_expected) {
+                  publish_payload(multi_did, multi_payload);
+                  multi_active = false;
+                }
+                return;
+              }
+              if (frame_type == 0x20 && multi_active) {  // consecutive frame — append to ongoing payload
+                for (size_t i = 1; i < x.size() && multi_payload.size() < multi_expected; i++) multi_payload.push_back(x[i]);
+                if (multi_payload.size() >= multi_expected) {
+                  publish_payload(multi_did, multi_payload);
+                  multi_active = false;
+                }
+                return;
+              }
+
+interval:
+  - interval: ${poll_interval}
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(write_lock);'
+          then:
+            - lambda: |-
+                uint32_t now = millis();
+                if (id(read_pending) && now - id(request_started_ms) < 1500) return;  // still waiting, not timed out yet
+                id(read_pending) = false;
+
+                if (id(poll_dids).empty()) return;
+                if (id(poll_index) >= id(poll_dids).size()) id(poll_index) = 0;
+                uint16_t did = id(poll_dids)[id(poll_index)++];
+
+                id(pending_did) = did;
+                id(request_started_ms) = now;
+                id(read_pending) = true;
+                id(cb)->send_data(0x680, 0, std::vector<uint8_t>{
+                  0x03, 0x22,
+                  (uint8_t) (did >> 8),
+                  (uint8_t) (did & 0xFF),
+                  0x00, 0x00, 0x00, 0x00
+                });
+
+sensor:
+  - platform: template
+    name: "DomesticHotWaterSensor Actual (DID 0271)"
+    id: va271_actual
+    icon: "mdi:thermometer-water"
+    unit_of_measurement: "°C"
+    device_class: "temperature"
+    state_class: "measurement"
+    accuracy_decimals: 1
+  - platform: template
+    name: "DomesticHotWaterBufferBottomTemperatureSensor Actual (DID 3232)"
+    id: va3232_actual
+    icon: "mdi:thermometer-water"
+    unit_of_measurement: "°C"
+    device_class: "temperature"
+    state_class: "measurement"
+    accuracy_decimals: 1
+  - platform: template
+    name: "DomesticHotWaterBufferMidTemperatureSensor Actual (DID 3233)"
+    id: va3233_actual
+    icon: "mdi:thermometer-water"
+    unit_of_measurement: "°C"
+    device_class: "temperature"
+    state_class: "measurement"
+    accuracy_decimals: 1
+  - platform: template
+    name: "DomesticHotWaterBufferTopTemperatureSensor Actual (DID 3234)"
+    id: va3234_actual
+    icon: "mdi:thermometer-water"
+    unit_of_measurement: "°C"
+    device_class: "temperature"
+    state_class: "measurement"
+    accuracy_decimals: 1
+  - platform: template
+    name: "CurrentElectricalPowerConsumptionSystem (DID 2488)"
+    id: va2488_power_system
+    icon: "mdi:flash"
+    unit_of_measurement: "W"
+    device_class: "power"
+    state_class: "measurement"
+    accuracy_decimals: 0
+  - platform: template
+    name: "CurrentThermalCapacitySystem (DID 2496)"
+    id: va2496_thermal_system
+    icon: "mdi:heat-wave"
+    unit_of_measurement: "W"
+    device_class: "power"
+    state_class: "measurement"
+    accuracy_decimals: 0
+  - platform: template
+    name: "EnergyConsumptionDomesticHotWater Today (DID 0565)"
+    id: va565_today
+    icon: "mdi:flash"
+    unit_of_measurement: "kWh"
+    device_class: "energy"
+    state_class: "total_increasing"
+    accuracy_decimals: 1
+  - platform: template
+    name: "GeneratedDomesticHotWaterOutput Today (DID 1391)"
+    id: va1391_today
+    icon: "mdi:water-boiler"
+    unit_of_measurement: "kWh"
+    device_class: "energy"
+    state_class: "total_increasing"
+    accuracy_decimals: 1
+  - platform: template
+    name: "HeatPumpCompressorStatistical starts (DID 2369)"
+    id: va2369_compressor_starts
+    icon: "mdi:counter"
+    state_class: "total_increasing"
+    accuracy_decimals: 0
+  - platform: template
+    name: "HeatPumpCompressorStatistical hours (DID 2369)"
+    id: va2369_compressor_hours
+    icon: "mdi:timer-outline"
+    unit_of_measurement: "h"
+    device_class: "duration"
+    state_class: "total_increasing"
+    accuracy_decimals: 0
+  - platform: template
+    name: "AdditionalElectricHeaterStatistical starts (DID 2370)"
+    id: va2370_heater_starts
+    icon: "mdi:counter"
+    state_class: "total_increasing"
+    accuracy_decimals: 0
+  - platform: template
+    name: "AdditionalElectricHeaterStatistical hours (DID 2370)"
+    id: va2370_heater_hours
+    icon: "mdi:timer-outline"
+    unit_of_measurement: "h"
+    device_class: "duration"
+    state_class: "total_increasing"
+    accuracy_decimals: 0
+  - platform: template
+    name: "COP Today"
+    id: cop_today
+    icon: "mdi:gauge"
+    state_class: "measurement"
+    accuracy_decimals: 2
+    lambda: |-
+      if (!id(va1391_today).has_state() || !id(va565_today).has_state()) return {};
+      if (id(va565_today).state <= 0.0f) return 0.0f;
+      return id(va1391_today).state / id(va565_today).state;
+    update_interval: 10s
+
+binary_sensor:
+  - platform: template
+    name: "HeatPumpCompressor PowerState (DID 2351)"
+    id: va2351_compressor_active
+    icon: "mdi:heat-pump"
+    device_class: "power"
+  - platform: template
+    name: "AdditionalElectricHeater PowerState (DID 2352)"
+    id: va2352_heater_active
+    icon: "mdi:heating-coil"
+    device_class: "power"
+
+text_sensor:
+  - platform: template
+    name: "DomesticHotWaterStatus (DID 2320)"
+    id: va2320_dhw_status
+    icon: "mdi:water-boiler"
+  - platform: template
+    name: "Date (DID 0505)"
+    id: va505_date
+    icon: "mdi:calendar"
+    entity_category: diagnostic
+  - platform: template
+    name: "Time (DID 0506)"
+    id: va506_time
+    icon: "mdi:clock-outline"
+    entity_category: diagnostic
+  - platform: template
+    name: "SoftwareVersion (DID 0580)"
+    id: va580_sw_version
+    icon: "mdi:chip"
+    entity_category: diagnostic
+  - platform: template
+    name: "HardwareVersion (DID 0581)"
+    id: va581_hw_version
+    icon: "mdi:chip"
+    entity_category: diagnostic
+
+number:
+  - platform: template
+    name: "DomesticHotWaterTemperatureSetpoint (DID 0396)"
+    id: va396_setpoint
+    icon: "mdi:thermometer-water"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    min_value: 35
+    max_value: 60
+    step: 1.0
+    mode: box
+    optimistic: false  # slider waits for the heat pump to confirm the new value before updating
+    lambda: return {};
+    set_action:
+      then:
+        - script.execute:
+            id: write_setpoint_0396
+            value: !lambda return x;
