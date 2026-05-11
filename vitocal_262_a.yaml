@@ -10,12 +10,28 @@ esphome:
     then:
       - delay: 3s  # wait for the CAN bus to be ready
       - lambda: |-
-          // UDS ReadDataByIdentifier: DID 0x0244 = 580 (SoftwareVersion) — one-shot, value never changes
+          // Block the poller so boot reads don't race with the interval timer
+          id(write_lock) = true;
+          // UDS ReadDataByIdentifier: DID 0x0244 = 580 (SoftwareVersion), one-shot, value never changes
+          id(pending_did) = 580;
+          id(request_started_ms) = millis();
+          id(read_pending) = true;
           id(cb)->send_data(0x680, 0, std::vector<uint8_t>{0x03, 0x22, 0x02, 0x44, 0x00, 0x00, 0x00, 0x00});
-      - delay: 200ms  # give the heat pump time to respond before sending the next request
+      - wait_until:
+          condition:
+            lambda: 'return !id(read_pending);'
+          timeout: 1500ms
       - lambda: |-
-          // UDS ReadDataByIdentifier: DID 0x0245 = 581 (HardwareVersion) — one-shot, value never changes
+          // UDS ReadDataByIdentifier: DID 0x0245 = 581 (HardwareVersion), one-shot, value never changes
+          id(pending_did) = 581;
+          id(request_started_ms) = millis();
+          id(read_pending) = true;
           id(cb)->send_data(0x680, 0, std::vector<uint8_t>{0x03, 0x22, 0x02, 0x45, 0x00, 0x00, 0x00, 0x00});
+      - wait_until:
+          condition:
+            lambda: 'return !id(read_pending);'
+          timeout: 1500ms
+      - lambda: 'id(write_lock) = false;'
 
 esp32:
   variant: esp32s3
@@ -26,7 +42,7 @@ esp32:
 
 logger:
   level: INFO
-  baud_rate: 0  # disable UART log output — the pins are used by the CAN transceiver
+  baud_rate: 0  # disable UART log output, the pins are used by the CAN transceiver
 
 api:
   encryption:
@@ -182,7 +198,7 @@ canbus:
                 return (float) (v / scale);
               };
               auto publish_temperature = [&](const std::vector<uint8_t> &p, auto &sensor_id) {
-                // byte 8 is the sensor status flag — 0 means the reading is valid
+                // byte 8 is the sensor status flag, 0 means the reading is valid
                 if (p.size() >= 9 && read_u(p, 8, 1) == 0) {
                   sensor_id->publish_state(scaled_value(p, 0, 2, 10.0f, true));
                 }
@@ -310,8 +326,13 @@ canbus:
               if (x.empty()) return;
               uint8_t frame_type = x[0] & 0xF0;
               // ISO 15765-2 (CAN transport layer) frame reassembly
-              if (frame_type == 0x00) {  // single frame — payload fits in one CAN message
+              if (frame_type == 0x00) {  // single frame, payload fits in one CAN message
                 uint8_t len = x[0] & 0x0F;
+                if (x.size() >= 4 && x[1] == 0x7F) {  // UDS negative response, unblock poller immediately
+                  ESP_LOGW("vitocal_262_a", "NRC: service=0x%02X code=0x%02X", x[2], x[3]);
+                  id(read_pending) = false;
+                  return;
+                }
                 if (x.size() >= 4 && len >= 3 && x[1] == 0x62) {
                   uint16_t did = ((uint16_t) x[2] << 8) | x[3];
                   std::vector<uint8_t> payload;
@@ -329,14 +350,14 @@ canbus:
                 multi_payload.reserve(multi_expected);
                 for (size_t i = 5; i < x.size() && multi_payload.size() < multi_expected; i++) multi_payload.push_back(x[i]);
                 multi_active = true;
-                id(cb)->send_data(0x680, 0, std::vector<uint8_t>{0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00});  // flow control: continue sending
+                id(cb)->send_data(0x680, 0, std::vector<uint8_t>{0x30, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00});  // flow control: continue sending, STmin=10ms
                 if (multi_payload.size() >= multi_expected) {
                   publish_payload(multi_did, multi_payload);
                   multi_active = false;
                 }
                 return;
               }
-              if (frame_type == 0x20 && multi_active) {  // consecutive frame — append to ongoing payload
+              if (frame_type == 0x20 && multi_active) {  // consecutive frame, append to ongoing payload
                 for (size_t i = 1; i < x.size() && multi_payload.size() < multi_expected; i++) multi_payload.push_back(x[i]);
                 if (multi_payload.size() >= multi_expected) {
                   publish_payload(multi_did, multi_payload);
